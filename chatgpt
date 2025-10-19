@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# install.sh -- MyVPN Panel (free edition) installer for Debian 12
+set -euo pipefail
+
+# Basic checks
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Sila jalankan sebagai root: sudo bash install.sh"
+  exit 1
+fi
+
+echo "MyVPN Panel installer (Debian 12) - Free Edition"
+echo "Memulakan pemasangan..."
+
+# Update & essential packages
+apt update -y
+apt upgrade -y
+apt install -y wget curl jq unzip git lsb-release ca-certificates cron socat lsof
+
+# Create swap 1GB if none
+SWAPFILE=/swapfile
+if ! swapon --show | grep -q "$SWAPFILE"; then
+  echo "Mencipta 1GB swap..."
+  fallocate -l 1G $SWAPFILE || dd if=/dev/zero of=$SWAPFILE bs=1M count=1024
+  chmod 600 $SWAPFILE
+  mkswap $SWAPFILE
+  swapon $SWAPFILE
+  echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+fi
+
+# Create install dir
+INSTALL_DIR=/opt/myvpn-panel
+mkdir -p $INSTALL_DIR
+chown root:root $INSTALL_DIR
+chmod 755 $INSTALL_DIR
+
+# Download Xray-core latest (try GitHub API)
+echo "Memuat turun Xray-core (linux-64)..."
+XRAY_TMP=/tmp/xray_download
+mkdir -p $XRAY_TMP
+XRAY_URL=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+  | jq -r '.assets[] | select(.name|test("linux-64.zip|xray-linux-64.zip|xray-linux-64.tar.gz")) | .browser_download_url' | head -n1)
+
+if [ -z "$XRAY_URL" ] || [ "$XRAY_URL" = "null" ]; then
+  echo "Gagal dapatkan url Xray automatik — cuba fallback..."
+  XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/xray-linux-64.zip"
+fi
+
+cd $XRAY_TMP
+curl -L -o xray.zip "$XRAY_URL" || { echo "Failed download xray"; exit 1; }
+unzip -o xray.zip -d xray_extract
+cp xray_extract/xray /usr/local/bin/xray
+cp -r xray_extract/geo* /usr/local/bin/ 2>/dev/null || true
+chmod +x /usr/local/bin/xray
+
+# Create xray dirs
+mkdir -p /etc/xray /var/log/xray
+chown -R root:root /etc/xray
+chmod 755 /etc/xray
+
+# Systemd service for xray
+cat >/etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now xray.service || true
+
+# Install nginx
+echo "Pasang nginx..."
+apt install -y nginx
+systemctl enable --now nginx
+
+# Create a self-signed cert (default) — user can replace with real cert later
+SSL_DIR=/etc/myvpn-ssl
+mkdir -p $SSL_DIR
+if [ ! -f "$SSL_DIR/fullchain.pem" ]; then
+  echo "Mencipta self-signed certificate (temporary)..."
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -subj "/CN=localhost" \
+    -keyout $SSL_DIR/privkey.pem -out $SSL_DIR/fullchain.pem
+fi
+
+# Nginx default site with reverse-proxy for multiple websocket paths
+cat >/etc/nginx/sites-available/myvpn.conf <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name _;
+
+    ssl_certificate     /etc/myvpn-ssl/fullchain.pem;
+    ssl_certificate_key /etc/myvpn-ssl/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Adjust large client body if needed
+    client_max_body_size 50M;
+
+    # Example websocket paths -> proxy to different local ports
+    location /vless-path-1 {
+        proxy_redirect off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_pass http://127.0.0.1:10001;
+    }
+
+    location /vless-path-2 {
+        proxy_redirect off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_pass http://127.0.0.1:10002;
+    }
+
+    # Add more paths as needed. We will provide management script to add paths/users.
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/myvpn.conf /etc/nginx/sites-enabled/myvpn.conf
+nginx -t && systemctl restart nginx
+
+# Create initial xray config with multiple inbounds (multi-path VLESS)
+cat >/etc/xray/config.json <<'EOF'
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": 10001,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "flow": ""
+          }
+        ],
+        "decryption": "none",
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vless-path-1"
+        }
+      }
+    },
+    {
+      "port": 10002,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "flow": ""
+          }
+        ],
+        "decryption": "none",
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vless-path-2"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "settings": {} },
+    { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
+  ],
+  "routing": {
+    "rules": []
+  }
+}
+EOF
+
+# Ensure logs exist
+touch /var/log/xray/access.log /var/log/xray/error.log
+chown -R root:root /var/log/xray
+chmod 644 /var/log/xray/*.log
+
+systemctl restart xray.service || true
+
+# Install menu script
+cat >/usr/local/bin/myvpn-menu <<'EOF'
+#!/usr/bin/env bash
+# Simple TUI menu for MyVPN Panel (run as root)
+set -euo pipefail
+MENU_COLOR="\e[32m"   # green by default (user said mix ok)
+ACCENT="\e[31m"       # red accent headings
+RESET="\e[0m"
+
+function sys_info {
+  OS="$(grep -E '^PRETTY_NAME' /etc/os-release | cut -d= -f2 | tr -d \")"
+  RAM=$(free -m | awk '/Mem:/ {printf("%dMB/%dMB",$3,$2)}')
+  CPU="$(nproc) core(s)"
+  UPTIME="$(uptime -p)"
+  IP="$(curl -s ifconfig.me || curl -s icanhazip.com || echo 'N/A')"
+  echo -e "${ACCENT}✴ WELCOME TO MY PREMIUM SCRIPT (FREE) ✴${RESET}"
+  echo -e "${ACCENT}-------------------------------------------${RESET}"
+  printf "OS        : %s\n" "$OS"
+  printf "RAM       : %s\n" "$RAM"
+  printf "CPU       : %s\n" "$CPU"
+  printf "IP VPS    : %s\n" "$IP"
+  printf "Uptime    : %s\n" "$UPTIME"
+  printf "Version   : xray (local) & myvpn-panel v1.0\n"
+  echo -e "${ACCENT}-------------------------------------------${RESET}"
+}
+
+function service_status {
+  echo -e "${MENU_COLOR}SERVICE STATUS${RESET}"
+  services=(ssh nginx xray)
+  for s in "${services[@]}"; do
+    if systemctl is-active --quiet $s; then
+      echo -e "Service ${s} = [ON]"
+    else
+      echo -e "Service ${s} = [OFF]"
+    fi
+  done
+}
+
+function add_vless_user {
+  # add user to a chosen inbound port (10001,10002,...)
+  read -p "Masukkan inbound port (contoh 10001) : " port
+  if ! grep -q "\"port\": $port" /etc/xray/config.json; then
+    echo "Port tidak wujud dalam config."
+    return
+  fi
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  read -p "Masukkan nama label user (contoh user1) : " label
+  # Insert client JSON (append to clients array for matching port)
+  tmp=$(mktemp)
+  jq --argjson p $port --arg id "$uuid" --arg name "$label" \
+    '(.inbounds[] | select(.port==$p) | .settings.clients) += [{"id":$id,"flow":"","email":$name}]' /etc/xray/config.json > $tmp && mv $tmp /etc/xray/config.json
+  systemctl restart xray
+  echo "User ditambah. UUID: $uuid"
+  echo "WebSocket path (use with TLS via nginx): depends which path configured in nginx (see /etc/nginx/sites-available/myvpn.conf)"
+}
+
+function list_vless_users {
+  echo "Senarai VLESS clients per inbound:"
+  jq -r '.inbounds[] | "Port: " + (.port|tostring) + " -> Clients: " + ( .settings.clients | map(.email + ":" + .id) | join(", ") )' /etc/xray/config.json || echo "Tiada clients."
+}
+
+function backup_config {
+  ts=$(date -u +"%Y%m%dT%H%M%SZ")
+  tar czf /root/myvpn-backup-$ts.tar.gz /etc/xray /etc/nginx /etc/myvpn-ssl /usr/local/bin/myvpn-menu || true
+  echo "Backup disimpan: /root/myvpn-backup-$ts.tar.gz"
+}
+
+function main_menu {
+  while true; do
+    clear
+    sys_info
+    echo
+    service_status
+    echo
+    echo -e "${ACCENT}[01]${RESET} Add VLESS user"
+    echo -e "${ACCENT}[02]${RESET} List VLESS users"
+    echo -e "${ACCENT}[03]${RESET} Restart services (nginx,xray)"
+    echo -e "${ACCENT}[04]${RESET} Add 1GB Swap"
+    echo -e "${ACCENT}[05]${RESET} Backup config"
+    echo -e "${ACCENT}[x]${RESET} Exit"
+    echo
+    read -p "Select From option [1-5 or x] : " opt
+    case "$opt" in
+      1) add_vless_user; read -p "Tekan enter untuk kembali..." ;;
+      2) list_vless_users; read -p "Tekan enter..." ;;
+      3) systemctl restart nginx xray; echo "Restart done."; read -p "Enter..." ;;
+      4) fallocate -l 1G /swapfile2 && chmod 600 /swapfile2 && mkswap /swapfile2 && swapon /swapfile2 && echo "/swapfile2 none swap sw 0 0" >> /etc/fstab; echo "Swap2 added."; read -p "Enter..." ;;
+      5) backup_config; read -p "Enter..." ;;
+      x|X) exit 0 ;;
+      *) echo "Pilihan tidak sah"; sleep 1 ;;
+    esac
+  done
+}
+
+main_menu
+EOF
+
+chmod +x /usr/local/bin/myvpn-menu
+
+# Make menu executable from /usr/local/bin for convenience
+ln -sf /usr/local/bin/myvpn-menu /usr/local/bin/myvpn-panel
+
+echo "Pemasangan selesai!"
+echo "Jalankan panel dengan: sudo myvpn-menu"
+echo "Fail penting:"
+echo " - Xray config : /etc/xray/config.json"
+echo " - Nginx site  : /etc/nginx/sites-available/myvpn.conf"
+echo " - SSL folder  : /etc/myvpn-ssl/"
+echo "Nota: jika anda ada domain awam, gantikan cert self-signed dan update nginx server_name lalu restart nginx."
